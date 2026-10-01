@@ -13,6 +13,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from . import compiler
+from . import config
 from . import vm as vm_mod
 from . import debugger as debugger_mod
 from . import profiler as profiler_mod
@@ -51,6 +52,7 @@ def run_all():
     _test_lists()
     _test_runtime_errors()
     _test_debugger()
+    _test_debug_sessions()
     _test_profiler()
     _test_memory_model()
     _test_storage()
@@ -180,6 +182,113 @@ def _test_debugger():
     snap3 = dbg.snapshot()
     ok_finish = snap3["finished"] is True and vm.output == ["3"]
     _check("调试器：继续运行到程序结束", ok_finish, str(vm.output))
+
+
+def _test_debug_sessions():
+    """会话生命周期治理：上限/失效/项目级联清理/停止不可访问/不破坏进行中的调试。"""
+    from . import service
+    svc = service.Service()
+
+    # 1) 编译失败不产生会话（会话表不被失败启动污染）。
+    svc.debug_start("print(undefined_var_xyz);", [])
+    _check("会话治理：编译失败不登记会话", len(svc.debug_sessions) == 0,
+           f"sessions={len(svc.debug_sessions)}")
+
+    # 2) 无断点程序启动即跑完，标记为 finished，但仍可查看。
+    st = svc.debug_start("var a = 1;\nprint(a);", [])
+    _check("会话治理：无断点启动到结束", st.get("finished") is True and st.get("ok"),
+           str({k: st.get(k) for k in ('ok', 'finished')}))
+
+    # 3) 有断点会话处于暂停（进行中）状态。（前端行号 0-based，服务端 +1 后命中第二行）
+    st = svc.debug_start("var b = 2;\nprint(b);", [1])
+    sid = st.get("session_id")
+    _check("会话治理：断点会话暂停且可访问",
+           st.get("reason") == "breakpoint"
+           and svc.debug_state(sid).get("ok")
+           and svc.debug_sessions[sid].is_paused())
+
+    # 4) 停止后会话立即删除，state/command 均不可再访问。
+    svc.debug_stop(sid)
+    gone_state = svc.debug_state(sid)
+    gone_cmd = svc.debug_command(sid, "continue_")
+    _check("会话治理：停止后会话不可再访问",
+           (not gone_state.get("ok")) and (not gone_cmd.get("ok"))
+           and sid not in svc.debug_sessions,
+           f"state_ok={gone_state.get('ok')}, cmd_ok={gone_cmd.get('ok')}")
+
+    # 5) 停止一个不存在的会话也安全返回。
+    r = svc.debug_stop("dbg-nonexistent")
+    _check("会话治理：重复/停止未知会话幂等", r.get("ok") and r.get("removed") is False)
+
+    # 6) 命令白名单：非法命令被拒绝（不触达任意方法）。
+    st = svc.debug_start("var c = 3;\nprint(c);", [1])
+    sid = st["session_id"]
+    bad = svc.debug_command(sid, "__class__")
+    _check("会话治理：非法调试命令被拒绝", bad.get("ok") is False)
+
+    # 7) 已结束会话只可查看、不可再驱动（清断点继续到结束后再发命令应被拒绝）。
+    svc.debug_command(sid, "continue_", breakpoints=[])
+    finish_cmd = svc.debug_command(sid, "step_instruction")
+    finish_view = svc.debug_state(sid)
+    _check("会话治理：结束会话可查看但拒绝继续操作",
+           finish_cmd.get("ok") is False and finish_view.get("finished") is True,
+           f"cmd_ok={finish_cmd.get('ok')}, finished={finish_view.get('finished')}")
+
+    # 8) 数量上限：达到 MAX_DEBUG_SESSIONS 时淘汰已结束/最久未访问会话，
+    #    但正在暂停、最近活跃的会话不被打断。
+    cap = config.MAX_DEBUG_SESSIONS
+    paused_ids = []
+    for i in range(cap):
+        s = svc.debug_start(f"var p{i} = {i};\nprint(p{i});", [1])
+        paused_ids.append(s["session_id"])
+    _check("会话治理：驻留会话数不超过上限",
+           len(svc.debug_sessions) == cap, f"count={len(svc.debug_sessions)}, cap={cap}")
+    # 再新建一个：最久未访问（最早创建）的暂停会话被淘汰，数量仍为 cap。
+    oldest = paused_ids[0]
+    newest = paused_ids[-1]
+    over = svc.debug_start("var z = 0;\nprint(z);", [1])
+    oldest_gone = oldest not in svc.debug_sessions and not svc.debug_state(oldest).get("ok")
+    newest_ok = svc.debug_state(newest).get("ok")
+    step = svc.debug_command(newest, "step_instruction")
+    _check("会话治理：达上限时最久未访问会话被淘汰",
+           over.get("ok") and oldest_gone and len(svc.debug_sessions) == cap)
+    _check("会话治理：活跃暂停会话不被淘汰且可继续单步",
+           newest_ok and step.get("ok"), f"newest_ok={newest_ok}, step_ok={step.get('ok')}")
+
+    # 8b) 当所有会话都在"执行中"（无可淘汰对象）时，新建被明确拒绝，不破坏存量。
+    for sess in svc.debug_sessions.values():
+        sess.vm.paused = False  # 模拟正处于 VM 运行、不可回收
+    before = len(svc.debug_sessions)
+    rejected = svc.debug_start("var q = 7;\nprint(q);", [1])
+    _check("会话治理：无可淘汰会话时拒绝新建且不影响存量",
+           rejected.get("ok") is False and len(svc.debug_sessions) == before,
+           f"rejected={rejected.get('ok')}, before={before}, after={len(svc.debug_sessions)}")
+    for sess in svc.debug_sessions.values():  # 复原，避免影响后续清理断言
+        sess.vm.paused = True
+
+    # 9) 空闲 TTL：把最后访问时间拨到很久以前，会话被判过期并清除。
+    s = svc.debug_start("var t = 9;\nprint(t);", [1])
+    tid = s["session_id"]
+    svc.debug_sessions[tid].last_access -= config.DEBUG_SESSION_IDLE_TTL + 1
+    expired = svc.debug_state(tid)
+    _check("会话治理：空闲超过 TTL 自动失效",
+           (not expired.get("ok")) and tid not in svc.debug_sessions)
+
+    # 10) 绝对 TTL：即便持续访问，超过绝对存活时间也失效。
+    s = svc.debug_start("var u = 9;\nprint(u);", [1])
+    uid = s["session_id"]
+    svc.debug_sessions[uid].created -= config.DEBUG_SESSION_MAX_TTL + 1
+    svc.debug_sessions[uid].touch()
+    _check("会话治理：超过绝对存活时间失效",
+           not svc.debug_state(uid).get("ok") and uid not in svc.debug_sessions)
+
+    # 11) 项目删除级联清理其会话（含暂停中的）。
+    p = svc.create_project("会话级联项目", "var m = 5;\nprint(m);")
+    s = svc.debug_start("var m = 5;\nprint(m);", [1], pid=p["id"])
+    csid = s["session_id"]
+    svc.delete_project(p["id"])
+    _check("会话治理：删除项目连带清理其调试会话",
+           csid not in svc.debug_sessions and not svc.debug_state(csid).get("ok"))
 
 
 def _test_profiler():

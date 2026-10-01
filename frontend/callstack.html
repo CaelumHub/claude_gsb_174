@@ -141,17 +141,29 @@
   }
 
   async function start() {
+    // 重新启动前先停掉本页旧会话，避免反复"启动调试"在服务端留下孤儿会话。
+    if (sid) { await ML.api.debugStop(sid); sid = null; }
     const data = await ML.api.debugStart(editor.getValue(), editor.getBreakpoints(), ML.Shell.getProjectId(), null);
     if (data.ok && data.session_id) sid = data.session_id;
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
     render(data);
+    if (!data.ok && !data.compile_failed && data.error) ML.toast(data.error, "err");
   }
   async function cmd(c) {
     if (!sid) return;
     const data = await ML.api.debugCommand(sid, c, editor.getBreakpoints());
+    // 会话已被停止 / 过期 / 淘汰：服务端已不可访问，本地同步复位。
+    if (!data.ok) {
+      sid = null; lastState = null; setButtons(false);
+      render(data);
+      return;
+    }
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
     render(data);
   }
+
+  // 离开 / 关闭页面时停止会话，服务端随即删除，防止残留可被继续访问。
+  window.addEventListener("beforeunload", () => { if (sid) ML.api.debugStop(sid); });
 
   document.getElementById("btn-start").onclick = start;
   document.getElementById("btn-cont").onclick = () => cmd("continue_");

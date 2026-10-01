@@ -166,17 +166,26 @@
   const esc = ML.escapeHtml;
 
   async function start() {
+    // 重新启动前先停掉本页旧会话，避免反复"启动调试"在服务端留下孤儿会话。
+    if (sid) { await ML.api.debugStop(sid); sid = null; }
     const code = editor.getValue();
     const data = await ML.api.debugStart(code, editor.getBreakpoints(), ML.Shell.getProjectId(), null);
     if (data.ok && data.session_id) { sid = data.session_id; active = true; }
     else active = false;
     setButtons(active && !data.finished && !data.not_started && !data.compile_failed);
     renderState(data);
+    if (!data.ok && !data.compile_failed && data.error) ML.toast(data.error, "err");
   }
 
   async function cmd(command) {
     if (!sid) return;
     const data = await ML.api.debugCommand(sid, command, editor.getBreakpoints());
+    // 会话已被停止 / 过期 / 淘汰：服务端已不可访问，本地同步复位。
+    if (!data.ok) {
+      sid = null; active = false; setButtons(false);
+      renderState(data);
+      return;
+    }
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
     renderState(data);
   }
@@ -187,12 +196,17 @@
   document.getElementById("btn-stepin").onclick = () => cmd("step_into");
   document.getElementById("btn-stepover").onclick = () => cmd("step_over");
   document.getElementById("btn-stepout").onclick = () => cmd("step_out");
-  document.getElementById("btn-stop").onclick = async () => {
+  document.getElementById("btn-stop").onclick = stopSession;
+
+  async function stopSession() {
     if (sid) await ML.api.debugStop(sid);
     sid = null; active = false; setButtons(false);
     editor.setCurrentLine(null);
     document.getElementById("dbg-status").innerHTML = ML.badge("已停止", "gray");
-  };
+  }
+
+  // 离开 / 关闭页面时停止会话，服务端随即删除，防止残留可被继续访问。
+  window.addEventListener("beforeunload", () => { if (sid) ML.api.debugStop(sid); });
 })();
 </script>
 </body>

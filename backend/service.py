@@ -15,6 +15,7 @@
 import os
 import shutil
 import time
+import threading
 import difflib
 import hashlib
 from typing import Dict, List, Optional
@@ -96,6 +97,9 @@ class Service:
         config.ensure_dirs()
         self.debug_sessions: Dict[str, "DebugSession"] = {}
         self._session_counter = 0
+        # 会话表在多线程 HTTP 服务下被并发读写，用可重入锁保护"查表/淘汰/增删"；
+        # VM 执行（可能耗时）在锁外进行，只在取到会话的短临界区内持锁。
+        self._sessions_lock = threading.RLock()
 
     # ==================================================================
     # 项目管理
@@ -143,9 +147,10 @@ class Service:
         d = storage.project_dir(pid)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
-        # 清理其调试会话
-        for sid in [s for s, sess in self.debug_sessions.items() if sess.project_id == pid]:
-            self.debug_sessions.pop(sid, None)
+        # 项目删除时连带清理其全部调试会话（含正在暂停的），杜绝孤儿会话残留。
+        with self._sessions_lock:
+            for sid in [s for s, sess in self.debug_sessions.items() if sess.project_id == pid]:
+                self.debug_sessions.pop(sid, None)
         return True
 
     # ==================================================================
@@ -329,47 +334,153 @@ class Service:
     # ==================================================================
     # 调试会话
     # ==================================================================
+    # 允许通过调试命令驱动的动作白名单（杜绝 getattr 任意方法调用）。
+    _DEBUG_COMMANDS = ("continue_", "step_instruction", "step_into",
+                       "step_over", "step_out")
+
     def _new_session_id(self):
         self._session_counter += 1
         return f"dbg-{self._session_counter:x}-{int(time.time()*1000)%100000:x}"
 
     def debug_start(self, source, breakpoints=None, pid=None, vid=None):
-        """创建并启动一个调试会话（编译 -> 建 VM -> 建调试器 -> 启动）。"""
-        sid = self._new_session_id()
-        sess = DebugSession(sid, source, [b + 1 for b in (breakpoints or [])], pid, vid)
-        self.debug_sessions[sid] = sess
+        """创建并启动一个调试会话（编译 -> 建 VM -> 建调试器 -> 启动）。
+
+        编译失败不产生会话；成功启动前先做过期清理与上限淘汰，保证驻留数量
+        始终不超过 ``config.MAX_DEBUG_SESSIONS``。
+        """
+        bp = [b + 1 for b in (breakpoints or [])]
+        sess = DebugSession(self._new_session_id(), source, bp, pid, vid)
+        # 先编译：编译失败直接返回诊断，绝不登记进会话表（避免失败残留）。
+        if not sess.result.success:
+            return sess.state()
+        with self._sessions_lock:
+            self._purge_expired_locked()
+            self._enforce_cap_locked()
+            if len(self.debug_sessions) >= config.MAX_DEBUG_SESSIONS:
+                # 全部是正在进行（暂停/运行）的会话，没有可淘汰对象。
+                return {
+                    "ok": False,
+                    "error": f"调试会话数量已达上限（{config.MAX_DEBUG_SESSIONS} 个），"
+                             "请先停止其他正在进行的调试后再试",
+                }
+            self.debug_sessions[sess.id] = sess
+        # VM 启动放在锁外，避免长执行阻塞其他请求的会话查表。
         sess.start()
-        return self.debug_state(sid)
+        return self.debug_state(sess.id)
 
     def debug_state(self, sid):
-        sess = self.debug_sessions.get(sid)
-        if not sess:
-            return {"ok": False, "error": "会话不存在或已过期", "session_id": sid}
+        with self._sessions_lock:
+            sess = self._get_live_session_locked(sid)
+            if not sess:
+                return {"ok": False, "error": "会话不存在或已过期", "session_id": sid}
+            sess.touch()
         return sess.state()
 
     def debug_command(self, sid, command, breakpoints=None):
-        sess = self.debug_sessions.get(sid)
-        if not sess:
-            return {"ok": False, "error": "会话不存在或已过期"}
-        if breakpoints is not None:
-            sess.set_breakpoints(breakpoints)
+        if command not in self._DEBUG_COMMANDS:
+            return {"ok": False, "error": f"不支持的调试命令: {command}", "session_id": sid}
+        with self._sessions_lock:
+            sess = self._get_live_session_locked(sid)
+            if not sess:
+                return {"ok": False, "error": "会话不存在或已过期", "session_id": sid}
+            # 已结束的会话只可查看、不可再驱动；防止对终结状态继续操作。
+            if sess.is_finished():
+                sess.touch()
+                return {
+                    "ok": False,
+                    "error": "调试已结束，无法继续操作",
+                    "session_id": sid,
+                    "finished": True,
+                }
+            if breakpoints is not None:
+                sess.set_breakpoints(breakpoints)
+            sess.touch()
+        # VM 执行在锁外进行。
         getattr(sess, command)()
         return self.debug_state(sid)
 
     def debug_stop(self, sid):
-        sess = self.debug_sessions.pop(sid, None)
+        """停止调试：立即从会话表删除，之后该会话不可再访问。"""
+        with self._sessions_lock:
+            sess = self.debug_sessions.pop(sid, None)
+        if sess is not None:
+            sess.dispose()
         return {"ok": True, "removed": bool(sess)}
 
     def debug_sessions_list(self):
-        return [{"session_id": s.id, "project_id": s.project_id,
-                 "started": s.started, "finished": s.vm.finished if s.vm else False}
-                for s in self.debug_sessions.values()]
+        with self._sessions_lock:
+            self._purge_expired_locked()
+            now = time.monotonic()
+            out = []
+            for s in self.debug_sessions.values():
+                out.append({
+                    "session_id": s.id,
+                    "project_id": s.project_id,
+                    "started": s.started_at_iso,
+                    "finished": s.is_finished(),
+                    "status": s.status(),
+                    "last_access": s.last_access_iso,
+                    "idle_ttl_s": config.DEBUG_SESSION_IDLE_TTL,
+                    "expires_in_s": max(0, int(sess_expires_in(s, now))),
+                })
+        return out
+
+    # ------------------------------------------------------------------
+    # 会话表内部维护（调用方须持有 self._sessions_lock）
+    # ------------------------------------------------------------------
+    def _get_live_session_locked(self, sid):
+        """取会话；若已过期（空闲/绝对 TTL）则顺带清除并返回 None。"""
+        sess = self.debug_sessions.get(sid)
+        if sess is None:
+            return None
+        if sess.is_expired():
+            self.debug_sessions.pop(sid, None)
+            sess.dispose()
+            return None
+        return sess
+
+    def _purge_expired_locked(self):
+        """清除所有已超过空闲 / 绝对 TTL 的会话。"""
+        for sid in [s for s, sess in self.debug_sessions.items() if sess.is_expired()]:
+            sess = self.debug_sessions.pop(sid, None)
+            if sess is not None:
+                sess.dispose()
+
+    def _enforce_cap_locked(self):
+        """数量超上限时淘汰可回收会话：先淘汰已结束的，再淘汰最久未访问的暂停会话。
+
+        正在执行（VM 短暂运行）的会话不在淘汰候选中；正在暂停等待下一步的会话
+        按"最久未访问优先"回收，因此活跃调试（持续单步/查看）不会被打断。
+        """
+        while len(self.debug_sessions) >= config.MAX_DEBUG_SESSIONS:
+            victim = None
+            # 1) 已结束（正常完成 / 出错 / 编译产物已终结）的优先回收
+            candidates = [s for s in self.debug_sessions.values() if s.is_finished()]
+            if candidates:
+                victim = min(candidates, key=lambda s: s.last_access)
+            else:
+                # 2) 暂停中、最久未访问的会话（正在执行的不会出现在此）
+                paused = [s for s in self.debug_sessions.values() if s.is_paused()]
+                if paused:
+                    victim = min(paused, key=lambda s: s.last_access)
+            if victim is None:
+                break
+            self.debug_sessions.pop(victim.id, None)
+            victim.dispose()
 
     def memory_snapshot(self, sid):
-        sess = self.debug_sessions.get(sid)
+        with self._sessions_lock:
+            sess = self._get_live_session_locked(sid)
         if not sess or not sess.vm:
             return None
         return sess.vm.heap.snapshot(sess.vm.frame_snapshot())
+
+
+def sess_expires_in(sess, now):
+    """会话剩余有效期（秒）：取空闲 TTL 与绝对 TTL 的较早者。"""
+    idle_deadline = sess.last_access + config.DEBUG_SESSION_IDLE_TTL
+    abs_deadline = sess.created + config.DEBUG_SESSION_MAX_TTL
+    return min(idle_deadline, abs_deadline) - now
 
 
 class DebugSession:
@@ -379,11 +490,56 @@ class DebugSession:
         self.id = sid
         self.source = source
         self.breakpoints = set(breakpoints)
-        self.project_id = pid
-        self.version_id = vid
+        self.project_id = pid or None
+        self.version_id = vid or None
         self.result = compiler_mod.compile_source(source)
         self.vm: Optional[vm_mod.VM] = None
         self.debugger: Optional[debugger_mod.Debugger] = None
+        self.started = False
+        # ---- 生命周期时间戳（monotonic 用于 TTL 判断，ISO 用于对外展示） ----
+        self.created = time.monotonic()
+        self.last_access = self.created
+        self.started_at_iso = storage.now_iso()
+        self.last_access_iso = self.started_at_iso
+
+    # ------------------------------------------------------------------
+    # 生命周期状态
+    # ------------------------------------------------------------------
+    def touch(self):
+        """标记一次访问，刷新空闲 TTL（正在调试的会话因此不会被过期清理）。"""
+        self.last_access = time.monotonic()
+        self.last_access_iso = storage.now_iso()
+
+    def is_expired(self):
+        now = time.monotonic()
+        if now - self.last_access > config.DEBUG_SESSION_IDLE_TTL:
+            return True
+        if now - self.created > config.DEBUG_SESSION_MAX_TTL:
+            return True
+        return False
+
+    def is_finished(self):
+        return bool(self.started and self.vm is not None and self.vm.finished)
+
+    def is_paused(self):
+        """暂停等待下一步命令——可作为上限淘汰的候选（按最久未访问排序）。"""
+        return bool(self.started and self.vm is not None
+                    and getattr(self.vm, "paused", False) and not self.vm.finished)
+
+    def status(self):
+        if not self.started or self.vm is None:
+            return "not_started"
+        if self.vm.finished:
+            return "finished"
+        if getattr(self.vm, "paused", False):
+            return "paused"
+        return "running"
+
+    def dispose(self):
+        """释放对 VM / 调试器 / 源码的引用，便于尽早回收内存。"""
+        self.debugger = None
+        self.vm = None
+        self.source = None
         self.started = False
 
     def set_breakpoints(self, lines):
