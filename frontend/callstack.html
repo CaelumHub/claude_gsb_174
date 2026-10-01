@@ -141,6 +141,8 @@
   }
 
   async function start() {
+    // 重复启动前先停掉上一个会话，避免会话只增不减
+    if (sid) { try { await ML.api.debugStop(sid); } catch (_) {} sid = null; }
     const data = await ML.api.debugStart(editor.getValue(), editor.getBreakpoints(), ML.Shell.getProjectId(), null);
     if (data.ok && data.session_id) sid = data.session_id;
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
@@ -152,6 +154,11 @@
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
     render(data);
   }
+
+  // 离开/关闭页面前尽力停止当前会话，防止会话残留
+  window.addEventListener("pagehide", () => {
+    if (sid) { try { navigator.sendBeacon && navigator.sendBeacon(`/api/debug/${encodeURIComponent(sid)}/stop`); } catch (_) {} }
+  });
 
   document.getElementById("btn-start").onclick = start;
   document.getElementById("btn-cont").onclick = () => cmd("continue_");

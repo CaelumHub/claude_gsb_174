@@ -92,7 +92,7 @@
         active = false;
         return;
       }
-      status.innerHTML = ML.badge("会话不存在或已过期", "red");
+      status.innerHTML = ML.badge(state.error || "会话不存在或已过期", "red");
       setButtons(false);
       active = false;
       return;
@@ -166,6 +166,8 @@
   const esc = ML.escapeHtml;
 
   async function start() {
+    // 同一页面重复启动前，先停掉上一个会话，避免会话只增不减
+    if (sid) { try { await ML.api.debugStop(sid); } catch (_) {} sid = null; }
     const code = editor.getValue();
     const data = await ML.api.debugStart(code, editor.getBreakpoints(), ML.Shell.getProjectId(), null);
     if (data.ok && data.session_id) { sid = data.session_id; active = true; }
@@ -180,6 +182,11 @@
     setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
     renderState(data);
   }
+
+  // 离开/关闭页面前尽力停止当前会话，防止会话残留
+  window.addEventListener("pagehide", () => {
+    if (sid) { try { navigator.sendBeacon && navigator.sendBeacon(`/api/debug/${encodeURIComponent(sid)}/stop`); } catch (_) {} }
+  });
 
   document.getElementById("btn-start").onclick = start;
   document.getElementById("btn-cont").onclick = () => cmd("continue_");

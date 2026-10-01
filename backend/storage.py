@@ -180,6 +180,11 @@ def now_iso() -> str:
     return time.strftime("%H:%M:%S", time.localtime())
 
 
+def iso_from_ts(ts: float) -> str:
+    """epoch 秒 -> 与 now_iso() 一致的本地时间字符串。"""
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
 def project_dir(project_id):
     return os.path.join(config.PROJECTS_DIR, project_id)
 

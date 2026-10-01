@@ -43,6 +43,12 @@ MAX_LIST_LEN = 1_000_000                # 列表最大长度
 MAX_SAMPLE_INTERVAL_MS = 1000           # 采样剖析最大间隔（毫秒）
 MIN_SAMPLE_INTERVAL_MS = 1              # 采样剖析最小间隔（毫秒）
 
+# 调试会话生命周期治理
+DEBUG_MAX_SESSIONS = 32                 # 同时驻留的调试会话数量硬上限
+DEBUG_IDLE_TIMEOUT_SEC = 30 * 60        # 进行中的会话空闲 30 分钟失效
+DEBUG_FINISHED_TTL_SEC = 5 * 60         # 已结束（自然跑完/出错）的会话保留 5 分钟
+DEBUG_SWEEP_INTERVAL_SEC = 60           # 后台清理线程的扫描周期（秒）
+
 
 def ensure_dirs():
     """确保运行所需的目录都存在（幂等）。"""
